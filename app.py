@@ -22,6 +22,7 @@ app = Flask(__name__)
 TOKEN_CACHE = {}
 TOKEN_CACHE_TIME = {}
 TOKEN_REFRESH_INTERVAL = 7200
+TOKEN_REFRESH_LOCK = threading.Lock()
 
 ACCOUNT_FILE = "account.bd.txt"
 TOKEN_FILE = "token_bd.json"
@@ -127,32 +128,54 @@ def fetch_token_from_api(uid, password, retries=3):
     return None
 
 def refresh_tokens():
-    try:
-        accounts = load_accounts()
-        if not accounts:
-            return False
-        new_tokens = []
-        for idx, account in enumerate(accounts):
-            token_data = fetch_token_from_api(account['uid'], account['password'])
-            if token_data:
-                new_tokens.append(token_data)
-            if idx < len(accounts) - 1:
-                time.sleep(2)
-        if new_tokens:
-            existing = load_tokens() if os.path.exists(TOKEN_FILE) else []
-            if existing:
-                existing_uids = {t.get('uid') for t in existing if 'uid' in t}
-                for token in existing:
-                    if token.get('uid') not in {t.get('uid') for t in new_tokens}:
-                        new_tokens.append(token)
+    # Prevent simultaneous requests from refreshing the same accounts. This is
+    # particularly important on startup, when every saved token may be expired.
+    with TOKEN_REFRESH_LOCK:
+        try:
+            accounts = load_accounts()
+            if not accounts:
+                app.logger.error("No accounts are configured for token refresh")
+                return False
+
+            new_tokens = []
+            for idx, account in enumerate(accounts):
+                token_data = fetch_token_from_api(account['uid'], account['password'])
+                if token_data and is_token_valid(token_data.get('token', '')):
+                    new_tokens.append(token_data)
+                if idx < len(accounts) - 1:
+                    time.sleep(2)
+
+            if not new_tokens:
+                app.logger.error("Token provider returned no valid tokens")
+                return False
+
+            # Do not call load_tokens() here. When the file contains only expired
+            # tokens, that function calls refresh_tokens() and used to recurse
+            # forever. Read the file directly and retain only still-valid entries.
+            existing = []
+            if os.path.exists(TOKEN_FILE):
+                try:
+                    with open(TOKEN_FILE, "r") as f:
+                        existing = json.load(f)
+                except (OSError, ValueError, TypeError):
+                    existing = []
+
+            refreshed_uids = {t.get('uid') for t in new_tokens}
+            new_tokens.extend(
+                t for t in existing
+                if t.get('uid') not in refreshed_uids
+                and is_token_valid(t.get('token', ''))
+            )
+
+            # A serverless filesystem may be read-only; the in-memory cache still
+            # makes the freshly issued tokens usable for the current instance.
             save_tokens(new_tokens)
             TOKEN_CACHE["BD"] = new_tokens
             TOKEN_CACHE_TIME["BD"] = datetime.now()
             return True
-        return False
-    except Exception as e:
-        app.logger.error(f"Error refreshing tokens: {e}")
-        return False
+        except Exception as e:
+            app.logger.exception(f"Error refreshing tokens: {e}")
+            return False
 
 def auto_refresh_tokens():
     while True:
@@ -219,7 +242,7 @@ async def send_like_request(encrypted_uid, token, url, session):
             'Expect': "100-continue",
             'X-Unity-Version': "2018.4.11f1",
             'X-GA': "v1 1",
-            'ReleaseVersion': "OB54"
+            'ReleaseVersion': token_release_version(token)
         }
         timeout = aiohttp.ClientTimeout(total=30)
         async with session.post(url, data=edata, headers=headers, timeout=timeout) as response:
@@ -256,6 +279,15 @@ async def send_likes(uid, url):
         return None
 
 # ---------- Get player info ----------
+def token_release_version(token, default="OB54"):
+    """Use the version for which the JWT was issued instead of a stale constant."""
+    try:
+        claims = jwt.decode(token, options={"verify_signature": False})
+        return claims.get("release_version") or default
+    except Exception:
+        return default
+
+
 def make_request(encrypted_uid, token):
     try:
         url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
@@ -269,14 +301,30 @@ def make_request(encrypted_uid, token):
             'Expect': "100-continue",
             'X-Unity-Version': "2018.4.11f1",
             'X-GA': "v1 1",
-            'ReleaseVersion': "OB54"
+            'ReleaseVersion': token_release_version(token)
         }
         response = requests.post(url, data=edata, headers=headers, verify=False, timeout=30)
         if response.status_code != 200:
+            app.logger.warning("Player info API returned HTTP %s", response.status_code)
             return None
-        return decode_protobuf(response.content)
+        result = decode_protobuf(response.content)
+        if result is None:
+            app.logger.warning("Player info API returned an invalid protobuf response")
+        return result
     except Exception as e:
+        app.logger.warning("Player info request failed: %s", e)
         return None
+
+
+def get_player_info(encrypted_uid, tokens):
+    """Try all valid tokens; one rejected account must not break the API."""
+    for token_data in tokens:
+        token = token_data.get('token', '')
+        if token and is_token_valid(token):
+            info = make_request(encrypted_uid, token)
+            if info is not None:
+                return info, token
+    return None, None
 
 # ---------- Flask Endpoints ----------
 @app.route('/like', methods=['GET'])
@@ -290,15 +338,23 @@ def handle_requests():
         if tokens is None or not tokens:
             return jsonify({"error": "No valid tokens available"}), 500
 
-        token = tokens[0]['token']
         encrypted_uid = enc(uid)
         if encrypted_uid is None:
-            return jsonify({"error": "Encryption failed"}), 500
+            return jsonify({"error": "Invalid UID or encryption failed"}), 400
 
-        # Before
-        before = make_request(encrypted_uid, token)
+        # Before: try every token because an individual game account can be
+        # rejected even though its JWT has not reached its exp timestamp.
+        before, token = get_player_info(encrypted_uid, tokens)
         if before is None:
-            return jsonify({"error": "Failed to get player info"}), 500
+            # Tokens may have been revoked after issuance. Refresh once and retry.
+            if refresh_tokens():
+                tokens = TOKEN_CACHE.get("BD", [])
+                before, token = get_player_info(encrypted_uid, tokens)
+        if before is None:
+            return jsonify({
+                "error": "Failed to get player info",
+                "details": "All game tokens were rejected or the upstream player-info service is unavailable"
+            }), 502
         before_json = json.loads(MessageToJson(before))
         before_like = int(before_json.get('AccountInfo', {}).get('Likes', 0))
 
@@ -311,9 +367,12 @@ def handle_requests():
         time.sleep(1)  # small delay for processing
 
         # After
-        after = make_request(encrypted_uid, token)
+        after, _ = get_player_info(encrypted_uid, tokens)
         if after is None:
-            return jsonify({"error": "Failed to get player info after likes"}), 500
+            return jsonify({
+                "error": "Failed to get player info after likes",
+                "details": "Likes were sent, but the upstream player-info service could not be read"
+            }), 502
         after_json = json.loads(MessageToJson(after))
         after_like = int(after_json.get('AccountInfo', {}).get('Likes', 0))
         player_name = str(after_json.get('AccountInfo', {}).get('PlayerNickname', ''))
