@@ -12,6 +12,7 @@ import like_count_pb2
 import uid_generator_pb2
 from google.protobuf.message import DecodeError
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import os
 from datetime import datetime, timedelta
@@ -99,11 +100,16 @@ def load_tokens():
         app.logger.error(f"Error loading tokens: {e}")
         return None
 
-def fetch_token_from_api(uid, password, retries=3):
-    url = f"https://guest-jwt.vercel.app/token?uid={uid}&password={password}"
+def fetch_token_from_api(uid, password, retries=1):
+    url = "https://guest-jwt.vercel.app/token"
     for attempt in range(retries):
         try:
-            response = requests.get(url, timeout=30)
+            # params also safely URL-encodes passwords containing special chars.
+            response = requests.get(
+                url,
+                params={"uid": uid, "password": password},
+                timeout=(4, 8)
+            )
             if response.status_code == 200:
                 data = response.json()
                 if data.get('status') == 'success' and 'token' in data:
@@ -137,13 +143,30 @@ def refresh_tokens():
                 app.logger.error("No accounts are configured for token refresh")
                 return False
 
+            # Fetching every account sequentially could block /like for many
+            # minutes when the provider was slow. Refresh accounts concurrently
+            # and keep the whole cold-start refresh within Render's request limit.
             new_tokens = []
-            for idx, account in enumerate(accounts):
-                token_data = fetch_token_from_api(account['uid'], account['password'])
-                if token_data and is_token_valid(token_data.get('token', '')):
-                    new_tokens.append(token_data)
-                if idx < len(accounts) - 1:
-                    time.sleep(2)
+            worker_count = min(10, len(accounts))
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    executor.submit(
+                        fetch_token_from_api,
+                        account['uid'],
+                        account['password']
+                    ): account['uid']
+                    for account in accounts
+                }
+                for future in as_completed(futures):
+                    try:
+                        token_data = future.result()
+                        if token_data and is_token_valid(token_data.get('token', '')):
+                            new_tokens.append(token_data)
+                    except Exception as e:
+                        app.logger.warning(
+                            "Token refresh failed for account %s: %s",
+                            futures[future], e
+                        )
 
             if not new_tokens:
                 app.logger.error("Token provider returned no valid tokens")
@@ -303,7 +326,9 @@ def make_request(encrypted_uid, token):
             'X-GA': "v1 1",
             'ReleaseVersion': token_release_version(token)
         }
-        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=30)
+        response = requests.post(
+            url, data=edata, headers=headers, verify=False, timeout=(4, 8)
+        )
         if response.status_code != 200:
             app.logger.warning("Player info API returned HTTP %s", response.status_code)
             return None
@@ -316,14 +341,18 @@ def make_request(encrypted_uid, token):
         return None
 
 
-def get_player_info(encrypted_uid, tokens):
-    """Try all valid tokens; one rejected account must not break the API."""
+def get_player_info(encrypted_uid, tokens, max_attempts=3):
+    """Try a few valid tokens without allowing an upstream outage to hang us."""
+    attempts = 0
     for token_data in tokens:
         token = token_data.get('token', '')
         if token and is_token_valid(token):
+            attempts += 1
             info = make_request(encrypted_uid, token)
             if info is not None:
                 return info, token
+            if attempts >= max_attempts:
+                break
     return None, None
 
 # ---------- Flask Endpoints ----------
@@ -345,11 +374,6 @@ def handle_requests():
         # Before: try every token because an individual game account can be
         # rejected even though its JWT has not reached its exp timestamp.
         before, token = get_player_info(encrypted_uid, tokens)
-        if before is None:
-            # Tokens may have been revoked after issuance. Refresh once and retry.
-            if refresh_tokens():
-                tokens = TOKEN_CACHE.get("BD", [])
-                before, token = get_player_info(encrypted_uid, tokens)
         if before is None:
             return jsonify({
                 "error": "Failed to get player info",
