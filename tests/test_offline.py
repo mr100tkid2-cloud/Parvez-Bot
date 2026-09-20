@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
 
 import jwt  # noqa: E402
 from Crypto.Cipher import AES  # noqa: E402
@@ -31,6 +32,7 @@ from Crypto.Util.Padding import unpad  # noqa: E402
 
 import like_pb2  # noqa: E402
 import like_count_pb2  # noqa: E402
+import garena_stub  # noqa: E402
 
 AES_KEY = b'Yg&tc%DEuh6%Zc^8'
 AES_IV = b'6oyZDr22E3ychjM%'
@@ -183,7 +185,7 @@ class StubServer:
         self.server.server_close()
 
 
-def start_app(cluster_hosts, accounts=None):
+def start_app(cluster_hosts, accounts=None, local_mint=False, garena=None, token_url=None):
     """(Re)import app.py with the stub upstreams wired in via env vars."""
     accounts = accounts or TEST_ACCOUNTS
     account_file = "/tmp/ff_test_accounts.txt"
@@ -194,7 +196,16 @@ def start_app(cluster_hosts, accounts=None):
     os.environ["FF_TOKEN_FILE"] = "/tmp/ff_test_tokens.json"
     os.environ["FF_CLIENT_HOSTS"] = ",".join(cluster_hosts)
     os.environ["FF_PLAYER_INFO_BUDGET"] = "20"
-    for module in [m for m in list(sys.modules) if m == "app"]:
+    os.environ["FF_LOCAL_MINT"] = "1" if local_mint else "0"
+    for var in ("FF_OAUTH_URL", "FF_INSPECT_URL", "FF_LOGIN_URL"):
+        os.environ.pop(var, None)
+    if garena is not None:
+        os.environ["FF_OAUTH_URL"] = garena_stub.stub_url(garena, "/oauth/guest/token/grant")
+        os.environ["FF_INSPECT_URL"] = garena_stub.stub_url(garena, "/oauth/token/inspect")
+        os.environ["FF_LOGIN_URL"] = garena_stub.stub_url(garena, "/MajorLogin")
+    if token_url is not None:
+        os.environ["FF_TOKEN_URL"] = token_url
+    for module in [m for m in list(sys.modules) if m in ("app", "jwt_maker")]:
         del sys.modules[module]
     if os.path.exists("/tmp/ff_test_tokens.json"):
         os.remove("/tmp/ff_test_tokens.json")
@@ -300,6 +311,34 @@ def main():
         check("token_status reports release version",
               status.get("release_versions") == ["OB55"] and status.get("count") == len(TEST_ACCOUNTS),
               json.dumps(status)[:300])
+
+        # ---------------------------------------------------------------- 6
+        # Provider dead: in-process minting (jwt_maker) takes over.
+        STATE.update({"release_version": "OB55", "required_release": "OB55",
+                      "cluster_status": None, "likes": 4242, "cluster_requests": []})
+        garena = garena_stub.start_garena_stub()
+        try:
+            garena_stub.reset_state()
+            app_module = start_app([cluster.url], local_mint=True, garena=garena,
+                                   token_url="http://127.0.0.1:9/token")
+            client = app_module.app.test_client()
+            response = client.get(f"/like?uid={TEST_UID}")
+            payload = response.get_json()
+            check("locally minted tokens drive /like when the provider is dead",
+                  response.status_code == 200
+                  and payload.get("LikesGivenByAPI") == len(TEST_ACCOUNTS),
+                  json.dumps(payload)[:300])
+            check("local mint used the Garena login flow",
+                  garena_stub.STATE["counts"]["oauth"] >= 1
+                  and garena_stub.STATE["counts"]["major"] >= 1,
+                  json.dumps(garena_stub.STATE["counts"]))
+            response = client.get("/token_status")
+            status = response.get_json()
+            check("locally minted tokens are OB55",
+                  status.get("release_versions") == ["OB55"], json.dumps(status)[:300])
+        finally:
+            garena.shutdown()
+            garena.server_close()
     finally:
         provider_server.stop()
         cluster.stop()

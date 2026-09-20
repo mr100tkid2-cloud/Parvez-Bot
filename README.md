@@ -1,6 +1,37 @@
 ZzZ
 @XPxBOTS
 
+## JWT maker (`jwt_maker.py`)
+
+A standalone service that mints Free Fire game JWTs itself — the in-house
+replacement for third-party providers like `guest-jwt.vercel.app` (which broke
+after OB55 with errors like `No valid platform found`). It reproduces the
+official client login: guest OAuth grant → AES-encrypted `GameData` protobuf →
+`MajorLogin` → game JWT.
+
+Run it on its own:
+
+```bash
+python3 jwt_maker.py          # listens on :5030 (PORT to override)
+```
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /token?uid=<uid>&password=<password>` | mint a JWT for one guest account |
+| `GET /token?access_token=<garena_access_token>` | mint from a Garena access token |
+| `GET /token` | batch-mint from `FF_ACCOUNT_FILE` (returns `{"tokens": [...], "failed": n}`) |
+| `GET /api/get_jwt?guest_uid=...&guest_password=...` | compact `{success, BearerAuth}` shape |
+| `GET /health` | login-endpoint config |
+
+Config: `FF_OAUTH_URL`, `FF_INSPECT_URL`, `FF_LOGIN_URL`
+(default `loginbp.ppmainecoonghj.com`), `FF_LOGIN_X_GA_SV` (default `1789534056`),
+`FF_CLIENT_VERSION` (default `1.132.2`), `FF_CACHE_SECONDS` (default 6h).
+
+The main bot uses it automatically when the provider fails (`FF_LOCAL_MINT=1`,
+the default). To point other bots at a hosted copy instead, set their token URL
+to `https://<your-deploy>/token?uid=...&password=...` — the response shape is
+drop-in compatible (`token`, `region`, `account_id`, ...).
+
 ## Endpoints
 
 | Endpoint | What it does |
@@ -18,6 +49,8 @@ answered, but refused the tokens. The response now also carries:
 * `reason` – `tokens_rejected`, `upstream_unreachable`, `rate_limited`, ...
 * `hint` – the likely cause, including a release-version mismatch
 * `upstream` – per-host HTTP status codes and response bodies
+* `refresh_error` – the last token-refresh error, including the provider's own
+  message (e.g. `No valid platform found`) so you don't have to read logs
 
 `GET /diagnose` (or `python3 diagnose.py`) is the quickest way to see the whole
 chain at once. It prints, without exposing tokens or passwords:
@@ -43,7 +76,8 @@ All of that is configurable now, so the next patch is an env-var change:
 | `FF_X_GA_SV` | `1789638359` | Client build stamp sent in `X-GA-SV`. |
 | `FF_CLIENT_HOSTS` | current + previous clusters | Comma separated cluster list, first entry preferred, the rest are failover. |
 | `FF_REGION` | `BD` | Region used when a token carries none. |
-| `FF_TOKEN_URL` | `https://guest-jwt.vercel.app/token` | Guest-JWT provider. |
+| `FF_TOKEN_URL` | `https://guest-jwt.vercel.app/token` | Guest-JWT provider (`off` to disable, e.g. when pointing at your own `jwt_maker`). |
+| `FF_LOCAL_MINT` | `1` | Mint tokens in-process via `jwt_maker.py` when the provider fails (`0` to disable). |
 | `FF_ACCOUNT_FILE` / `FF_TOKEN_FILE` | `account.bd.txt` / `token_bd.json` | Account list and token cache. |
 | `FF_TOKEN_ATTEMPTS` | `5` | Tokens tried per player-info lookup. |
 | `FF_PLAYER_INFO_BUDGET` | `25` | Wall-clock seconds budgeted for one lookup. |
@@ -54,9 +88,13 @@ fix is a current provider (or minting the JWT in-process).
 
 ## Tests
 
-`python3 tests/test_offline.py` runs the app against stub upstreams (a fake
-guest-JWT provider and a fake game cluster) and covers the happy path, cluster
-failover, release-version drift, a broken provider and `/diagnose`.
+Two suites run the app against stub upstreams, no Garena contact needed:
+
+* `python3 tests/test_offline.py` — the like bot: happy path, cluster failover,
+  release-version drift, broken provider, `/diagnose`, `/token_status`, and the
+  provider-dead → local-mint fallback.
+* `python3 tests/test_jwt_maker.py` — the JWT maker: minting via OAuth +
+  MajorLogin, caching, batch mode, access-token flow and error translation.
 
 ## Security note
 

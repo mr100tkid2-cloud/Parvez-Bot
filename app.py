@@ -54,7 +54,13 @@ def _env_list(name, default):
 CURRENT_RELEASE_VERSION = os.environ.get("FF_RELEASE_VERSION", "OB55")
 X_GA_SV = os.environ.get("FF_X_GA_SV", "1789638359")
 DEFAULT_REGION = os.environ.get("FF_REGION", "BD")
-TOKEN_URL = os.environ.get("FF_TOKEN_URL", "https://guest-jwt.vercel.app/token")
+TOKEN_URL = os.environ.get("FF_TOKEN_URL", "https://guest-jwt.vercel.app/token").strip()
+if TOKEN_URL.lower() in ("", "off", "none"):
+    TOKEN_URL = None
+# When the third-party provider is down/broken (as guest-jwt.vercel.app became
+# after OB55), mint tokens in-process via jwt_maker.py. Disable with
+# FF_LOCAL_MINT=0.
+LOCAL_MINT_ENABLED = os.environ.get("FF_LOCAL_MINT", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # Oldest first is a mistake here: the first entry is the one the majority of
 # requests use, the rest are failover targets.
@@ -238,6 +244,56 @@ def fetch_token_from_api(uid, password, retries=1):
     return None, last_error or "provider request failed"
 
 
+def mint_token_locally(uid, password):
+    """Mint a game JWT in-process (Garena guest-login flow, see jwt_maker.py).
+
+    Returns the same token_data shape as fetch_token_from_api.
+    """
+    try:
+        import jwt_maker
+    except Exception as e:
+        return None, f"local mint unavailable: {type(e).__name__}: {str(e)[:140]}"
+    try:
+        result = jwt_maker.mint_token(uid, password)
+    except Exception as e:
+        return None, f"local mint error: {type(e).__name__}: {str(e)[:160]}"
+    token = (result or {}).get("token")
+    if not token or token == "N/A":
+        return None, f"local mint failed: {(result or {}).get('error', str(result))[:160]}"
+    claims = token_claims(token)
+    return {
+        "token": token,
+        "uid": str(result.get("account_id") or uid),
+        "region": result.get("region") or claims.get("noti_region") or DEFAULT_REGION,
+        "access_token": result.get("token_access", ""),
+        "open_id": "",
+        "account_name": "",
+        "release_version": claims.get("release_version", ""),
+        "fetched_at": int(time.time()),
+        "source": "local",
+    }, None
+
+
+def fetch_account_token(uid, password):
+    """Try every configured token source in order: provider URL, then local
+    minting. Returns (token_data, error_describing_all_sources)."""
+    errors = []
+    if TOKEN_URL:
+        token_data, error = fetch_token_from_api(uid, password)
+        if token_data:
+            token_data["source"] = "provider"
+            return token_data, None
+        errors.append(f"provider: {error}")
+    if LOCAL_MINT_ENABLED:
+        token_data, error = mint_token_locally(uid, password)
+        if token_data:
+            return token_data, None
+        errors.append(f"local: {error}")
+    if not errors:
+        errors.append("no token source configured (FF_TOKEN_URL off, FF_LOCAL_MINT off)")
+    return None, "; ".join(errors)
+
+
 def refresh_tokens(force=False):
     """Refresh every configured guest account concurrently.
 
@@ -262,7 +318,7 @@ def refresh_tokens(force=False):
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 futures = {
                     executor.submit(
-                        fetch_token_from_api,
+                        fetch_account_token,
                         account['uid'],
                         account['password']
                     ): account['uid']
@@ -690,7 +746,7 @@ def _player_fields(info):
 
 def _failure_response(error, diag, status=502):
     attempts = diag.get("attempts", [])
-    return jsonify({
+    payload = {
         "error": error,
         "details": diag.get("hint") or "All game tokens were rejected or the upstream player-info service is unavailable",
         "reason": diag.get("reason"),
@@ -702,7 +758,26 @@ def _failure_response(error, diag, status=502):
             "x_ga_sv": X_GA_SV,
             "clusters": hosts_for_region(DEFAULT_REGION),
         },
-    }), status
+    }
+    # Surface the last token-refresh error (e.g. the provider's
+    # "No valid platform found") so nobody has to read logs for it.
+    if TOKEN_CACHE_ERROR.get("BD"):
+        payload["refresh_error"] = TOKEN_CACHE_ERROR["BD"]
+    return jsonify(payload), status
+
+
+@app.route('/', methods=['GET'])
+def index():
+    return jsonify({
+        "service": "free-fire-like-api",
+        "endpoints": {
+            "/like?uid=<UID>": "send likes and read back before/after counts",
+            "/token_status": "token count, expiry and release version",
+            "/refresh_tokens": "mint fresh tokens for every configured account",
+            "/diagnose": "find which hop is broken (provider -> token -> cluster)",
+        },
+        "release_version": CURRENT_RELEASE_VERSION,
+    })
 
 
 @app.route('/like', methods=['GET'])
@@ -780,7 +855,7 @@ def handle_requests():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/refresh_tokens', methods=['POST'])
+@app.route('/refresh_tokens', methods=['GET', 'POST'])
 def refresh_tokens_endpoint():
     if refresh_tokens():
         tokens = TOKEN_CACHE.get("BD", [])
@@ -853,7 +928,7 @@ def build_diagnosis(limit=3, probe_clusters=True):
     accounts = load_accounts()[:limit]
     minted = []
     for account in accounts:
-        token_data, error = fetch_token_from_api(account['uid'], account['password'])
+        token_data, error = fetch_account_token(account['uid'], account['password'])
         report["provider"]["checked"] += 1
         sample = {"account_uid": account['uid']}
         if token_data:
